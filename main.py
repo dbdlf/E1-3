@@ -5,8 +5,10 @@ MAC(Multiply-Accumulate) 연산으로 입력 패턴이 어떤 필터(Cross / X)�
 
 - 외부 라이브러리 없이 표준 라이브러리(json, time 등)만 사용한다.
 - 실행: python main.py [data.json 경로]
+- 보너스: 1차원 배열 MAC(mac_flat) 최적화 비교, Cross/X 패턴 생성기(generate_pattern)
 """
 
+import gc
 import json
 import math
 import os
@@ -22,6 +24,12 @@ EPSILON = 1e-9          # 점수 비교 허용오차: |a - b| < EPSILON 이면 �
 EPSILON_TEXT = "1e-9"   # 출력용 표기
 REPEAT = 10             # 성능 측정 반복 횟수 (평균을 낸다)
 USER_INPUT_SIZE = 3     # 모드 1 입력 크기
+GEN_MIN_SIZE = 3        # 패턴 생성기 최소 크기 (N<3 이면 Cross와 X가 구별되지 않음)
+GEN_MAX_SIZE = 200      # 패턴 생성기 최대 크기 (콘솔 대기 시간 제한)
+GEN_DEFAULT_SIZES = (3, 5, 13, 25, 50, 100)
+PREVIEW_MAX_SIZE = 9    # 생성 패턴 미리보기를 출력할 최대 크기
+OPT_TARGET_MS = 2.0     # 최적화 비교: 1회 측정 구간의 목표 길이(ms)
+OPT_MAX_BATCH = 4096    # 최적화 비교: 1회 측정당 최대 연속 호출 수
 
 LABEL_CROSS = "Cross"
 LABEL_X = "X"
@@ -48,10 +56,6 @@ CAT_SCHEMA = "데이터/스키마"
 CAT_LABEL = "라벨 정규화"
 CAT_TIE = "수치 비교(동점)"
 CAT_MISMATCH = "판정 불일치"
-
-# 성능 분석의 3×3 기준 데이터 (미션 소개의 십자가 필터 / X 패턴)
-BASE_CROSS_3 = [[0, 1, 0], [1, 1, 1], [0, 1, 0]]
-BASE_X_3 = [[1, 0, 1], [0, 1, 0], [1, 0, 1]]
 
 
 class ValidationError(ValueError):
@@ -109,6 +113,45 @@ class Matrix:
     def size_text(self):
         return f"{self.n}×{self.n}"
 
+    def flatten(self):
+        """[보너스 1] 행 우선(row-major) 순서의 1차원 리스트(길이 N²)로 변환한다.
+
+        (row, col) 위치는 1차원에서 k = row * n + col 이 된다.
+        """
+        flat = []
+        for row in self.data:
+            flat.extend(row)
+        return flat
+
+
+# ---------------------------------------------------------------------------
+# [보너스 2] 패턴 생성기
+# ---------------------------------------------------------------------------
+def center_indices(n):
+    """가운데 줄 번호. 홀수 N은 1줄, 짝수 N은 정확한 중앙이 없으므로 가운데 2줄."""
+    if n % 2 == 1:
+        return {n // 2}
+    return {n // 2 - 1, n // 2}
+
+
+def generate_pattern(label, n):
+    """크기 N의 Cross(십자가) 또는 X 패턴을 1.0/0.0 값으로 만든다."""
+    if not isinstance(n, int) or n < 1:
+        raise ValidationError(f"패턴 크기는 1 이상의 정수여야 합니다 (받은 값: {n!r})")
+    if label not in (LABEL_CROSS, LABEL_X):
+        raise ValidationError(f"생성할 수 없는 라벨입니다: {label!r}")
+    matrix = Matrix(n)
+    centers = center_indices(n)
+    for i in range(n):
+        for j in range(n):
+            if label == LABEL_CROSS:
+                on = i in centers or j in centers      # 가운데 행 또는 가운데 열
+            else:
+                on = i == j or i + j == n - 1          # 주대각선 또는 반대 대각선
+            if on:
+                matrix.set(i, j, 1.0)
+    return matrix
+
 
 # ---------------------------------------------------------------------------
 # 2. 라벨 정규화
@@ -139,6 +182,16 @@ def mac(pattern, filt):
     return total
 
 
+def mac_flat(p_flat, f_flat):
+    """[보너스 1] 1차원 배열(길이 N²) 버전 MAC. 이중 반복문 대신 인덱스 k 하나로 순회한다."""
+    if len(p_flat) != len(f_flat):
+        raise ValidationError(f"크기 불일치: 패턴 길이 {len(p_flat)} ≠ 필터 길이 {len(f_flat)}")
+    total = 0.0
+    for k in range(len(p_flat)):
+        total += p_flat[k] * f_flat[k]
+    return total
+
+
 def is_tie(score_a, score_b, epsilon=EPSILON):
     """허용오차 기반 동점 판정."""
     return abs(score_a - score_b) < epsilon
@@ -162,18 +215,89 @@ def naive_judge(score_a, score_b, label_a, label_b):
 # 4. 성능 측정
 # ---------------------------------------------------------------------------
 def measure_ms(func, repeat=REPEAT):
-    """func 호출 구간만 repeat회 측정해 평균(ms)을 돌려준다. (I/O 제외)"""
+    """func 호출 구간만 repeat회 측정해 평균(ms)을 돌려준다. (I/O 제외)
+
+    측정 중에는 가비지 컬렉터를 잠시 멈춘다 (timeit과 같은 방식). 우연히 GC가
+    한 번의 측정에 끼어들어 평균을 튀게 만드는 것을 막기 위해서다.
+    """
     func()  # 워밍업 1회 (측정에서 제외)
-    total = 0.0
-    for _ in range(repeat):
-        start = time.perf_counter()
-        func()
-        total += time.perf_counter() - start
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        total = 0.0
+        for _ in range(repeat):
+            start = time.perf_counter()
+            func()
+            total += time.perf_counter() - start
+    finally:
+        if gc_was_enabled:
+            gc.enable()
     return total / repeat * 1000.0
+
+
+def calibrate_batch(func, target_ms=OPT_TARGET_MS):
+    """[보너스 1] 1회 측정 구간이 target_ms 이상이 되도록 연속 호출 횟수(batch)를 정한다.
+
+    3×3 MAC 한 번은 1µs도 안 걸려서 타이머 오차·잡음이 결과를 좌우한다.
+    여러 번을 묶어 한 구간으로 재면 1회당 시간을 안정적으로 얻을 수 있다.
+    """
+    batch = 1
+    while batch < OPT_MAX_BATCH:
+        start = time.perf_counter()
+        for _ in range(batch):
+            func()
+        if (time.perf_counter() - start) * 1000.0 >= target_ms:
+            break
+        batch *= 2
+    return batch
+
+
+def measure_pair_ms(func_a, func_b, repeat=REPEAT, batch=1):
+    """[보너스 1] 두 함수를 같은 횟수만큼 번갈아 측정해 (a 1회 평균 ms, b 1회 평균 ms)를 돌려준다.
+
+    - repeat회 측정하고, 1회 측정마다 같은 함수를 batch번 연속 호출한다. (두 함수 모두 같은 횟수)
+    - 한쪽을 몰아서 재면 CPU 클럭 변화나 캐시 상태가 한쪽에만 유리할 수 있어 번갈아 잰다.
+    """
+    func_a()  # 워밍업 (측정에서 제외)
+    func_b()
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        total_a = total_b = 0.0
+        for _ in range(repeat):
+            start = time.perf_counter()
+            for _ in range(batch):
+                func_a()
+            total_a += time.perf_counter() - start
+            start = time.perf_counter()
+            for _ in range(batch):
+                func_b()
+            total_b += time.perf_counter() - start
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+    calls = repeat * batch
+    return total_a / calls * 1000.0, total_b / calls * 1000.0
 
 
 def benchmark_mac(pattern, filt, repeat=REPEAT):
     return measure_ms(lambda: mac(pattern, filt), repeat)
+
+
+def benchmark_2d_vs_1d(pattern, filt, repeat=REPEAT):
+    """[보너스 1] 같은 입력·같은 반복 횟수로 2D MAC과 1D MAC을 비교한다.
+
+    1차원 변환(flatten)은 데이터 로드 단계에서 한 번만 하는 전처리로 보고 측정 구간에서 뺀다.
+    반환: {"n", "ms_2d", "ms_1d", "batch", "same"}  (same: 두 방식의 점수가 비트 단위까지 같은지)
+    """
+    p_flat = pattern.flatten()
+    f_flat = filt.flatten()
+    run_2d = lambda: mac(pattern, filt)
+    run_1d = lambda: mac_flat(p_flat, f_flat)
+    batch = calibrate_batch(run_2d)
+    ms_2d, ms_1d = measure_pair_ms(run_2d, run_1d, repeat, batch)
+    same = run_2d() == run_1d()
+    return {"n": pattern.n, "ms_2d": ms_2d, "ms_1d": ms_1d, "batch": batch, "same": same}
 
 
 # ---------------------------------------------------------------------------
@@ -226,6 +350,41 @@ def print_perf_table(rows, repeat=REPEAT):
     print(f"(각 크기별 MAC 함수 호출 구간만 {repeat}회 측정한 평균, 워밍업 1회 제외)")
 
 
+def print_optimization_table(results, repeat=REPEAT):
+    """[보너스 1] 2D vs 1D 최적화 전/후 비교표."""
+    widths = (10, 14, 14, 12, 14, 12)
+    print(
+        pad("크기", widths[0])
+        + pad("2D 전(ms)", widths[1], "right")
+        + pad("1D 후(ms)", widths[2], "right")
+        + pad("속도 비율", widths[3], "right")
+        + pad("측정당 호출", widths[4], "right")
+        + pad("점수 일치", widths[5], "right")
+    )
+    print("-" * sum(widths))
+    for r in results:
+        ratio = r["ms_2d"] / r["ms_1d"] if r["ms_1d"] > 0 else float("inf")
+        print(
+            pad(f"{r['n']}×{r['n']}", widths[0])
+            + pad(f"{r['ms_2d']:.5f}", widths[1], "right")
+            + pad(f"{r['ms_1d']:.5f}", widths[2], "right")
+            + pad(f"{ratio:.2f}x", widths[3], "right")
+            + pad(str(r["batch"]), widths[4], "right")
+            + pad("✓" if r["same"] else "✗", widths[5], "right")
+        )
+    print(f"(MAC 1회당 평균 시간 · 같은 입력으로 2D/1D를 {repeat}회씩 번갈아 측정, 1회 측정 = '측정당 호출'만큼 연속 실행)")
+    print("(속도 비율 = 2D 시간 ÷ 1D 시간 → 1보다 크면 1D가 빠름 · 점수 일치 = 두 방식의 MAC 결과가 완전히 같은지)")
+
+
+def run_performance(cases, repeat=REPEAT):
+    """cases: [(pattern, filter), ...] → 성능 표(필수)와 2D/1D 비교표(보너스)를 함께 출력."""
+    print_perf_table([(p.n, benchmark_mac(p, f, repeat)) for p, f in cases], repeat)
+    results = [benchmark_2d_vs_1d(p, f, repeat) for p, f in cases]
+    print()
+    print("[최적화 비교: 2차원 배열 → 1차원 배열(길이 N²)]")
+    print_optimization_table(results, repeat)
+
+
 # ---------------------------------------------------------------------------
 # 입력 도우미
 # ---------------------------------------------------------------------------
@@ -261,12 +420,25 @@ def parse_row(line, n):
 
 
 def read_matrix(title, n=USER_INPUT_SIZE):
-    """n줄을 한 줄씩 입력받는다. 잘못된 줄은 안내 후 그 줄만 다시 입력받는다."""
-    print(f"{title} ({n}줄 입력, 공백 구분)")
+    """n줄을 한 줄씩 입력받는다. 잘못된 줄은 안내 후 그 줄만 다시 입력받는다.
+
+    [보너스 2] 첫 줄에 숫자 대신 cross / + / x 를 입력하면 패턴 생성기로 n×n 전체를 채운다.
+    """
+    print(f"{title} ({n}줄 입력, 공백 구분 · 첫 줄에 cross 또는 x 입력 시 자동 생성)")
     matrix = Matrix(n)
     row = 0
     while row < n:
         line = read_line()
+        label = normalize_label(line)
+        if label is not None:
+            if row == 0:
+                generated = generate_pattern(label, n)
+                print(f"  → 패턴 생성기: {n}×{n} {label} 패턴으로 채웠습니다")
+                print_matrix(generated, indent="    ")
+                return generated
+            print("  입력 형식 오류: 자동 생성(cross/x)은 첫 줄에서만 사용할 수 있습니다.")
+            print(f"  → {row + 1}번째 줄을 다시 입력하세요.")
+            continue
         try:
             values = parse_row(line, n)
         except ValidationError as err:
@@ -283,11 +455,12 @@ def choose_mode():
     print("[모드 선택]")
     print("1. 사용자 입력 (3x3)")
     print("2. data.json 분석")
+    print("3. 패턴 생성기 + 최적화 비교 (보너스)")
     while True:
         choice = read_line("선택: ").strip()
-        if choice in ("1", "2"):
+        if choice in ("1", "2", "3"):
             return choice
-        print("  잘못된 선택입니다. 1 또는 2를 입력하세요.")
+        print("  잘못된 선택입니다. 1, 2, 3 중 하나를 입력하세요.")
 
 
 # ---------------------------------------------------------------------------
@@ -326,7 +499,7 @@ def run_user_mode():
         print(f"판정: {verdict}")
 
     section(f"[4] 성능 분석 (평균/{REPEAT}회)")
-    print_perf_table([(n, benchmark_mac(pattern, filter_a))])
+    run_performance([(pattern, filter_a)])
 
 
 # ---------------------------------------------------------------------------
@@ -517,22 +690,25 @@ def run_json_mode(path):
             print_case(result)
 
     section(f"[3] 성능 분석 (평균/{REPEAT}회)")
-    print_perf_table(benchmark_sizes(filters, patterns))
+    run_performance(benchmark_cases(filters, patterns))
 
     section("[4] 결과 요약")
     print_summary(results)
 
 
-def benchmark_sizes(filters, patterns):
-    """3×3(기준 데이터) + 로드된 필터 크기별 MAC 1회 평균 시간."""
-    rows = [(3, benchmark_mac(Matrix.from_rows(BASE_X_3), Matrix.from_rows(BASE_CROSS_3)))]
+def benchmark_cases(filters, patterns):
+    """성능 분석용 (패턴, 필터) 목록: 3×3 + 로드된 필터 크기들.
+
+    3×3은 data.json에 없으므로 패턴 생성기로 만든 X 패턴 × Cross 필터를 쓴다. (보너스 2 재활용)
+    다른 크기는 data.json의 실제 패턴을 쓰고, 없으면 생성기 패턴으로 대신한다.
+    """
+    cases = [(generate_pattern(LABEL_X, 3), generate_pattern(LABEL_CROSS, 3))]
     for n in sorted(filters):
         if n == 3:
             continue
-        cross_filter = filters[n][LABEL_CROSS]
-        pattern = find_sample_pattern(n, patterns) or filters[n][LABEL_X]
-        rows.append((n, benchmark_mac(pattern, cross_filter)))
-    return rows
+        pattern = find_sample_pattern(n, patterns) or generate_pattern(LABEL_X, n)
+        cases.append((pattern, filters[n][LABEL_CROSS]))
+    return cases
 
 
 def find_sample_pattern(n, patterns):
@@ -569,6 +745,84 @@ def print_summary(results):
 
 
 # ---------------------------------------------------------------------------
+# 모드 3 (보너스): 패턴 생성기 + 최적화 비교
+# ---------------------------------------------------------------------------
+def parse_sizes(line):
+    """'3 5 13' 같은 크기 목록을 파싱한다. 빈 줄이면 기본 크기 목록."""
+    tokens = line.split()
+    if not tokens:
+        return list(GEN_DEFAULT_SIZES)
+    sizes = []
+    for token in tokens:
+        try:
+            n = int(token)
+        except ValueError:
+            raise ValidationError(f"'{token}'은(는) 정수가 아닙니다.")
+        if not GEN_MIN_SIZE <= n <= GEN_MAX_SIZE:
+            raise ValidationError(f"크기 {n}은(는) {GEN_MIN_SIZE}~{GEN_MAX_SIZE} 범위여야 합니다.")
+        if n not in sizes:
+            sizes.append(n)
+    return sizes
+
+
+def print_preview(cross, x):
+    """Cross / X 패턴을 나란히 ■□로 출력한다."""
+    width = cross.n * 2 + 4
+    print(pad(LABEL_CROSS, width) + LABEL_X)
+    for r in range(cross.n):
+        left = "".join("■" if cross.get(r, c) else "□" for c in range(cross.n))
+        right = "".join("■" if x.get(r, c) else "□" for c in range(x.n))
+        print(pad(left, width) + right)
+
+
+def run_generator_mode():
+    section("[1] 크기 입력")
+    print(f"생성할 크기 N을 공백으로 구분해 입력하세요 ({GEN_MIN_SIZE}~{GEN_MAX_SIZE}, "
+          f"빈 줄 = 기본값 {' '.join(map(str, GEN_DEFAULT_SIZES))})")
+    while True:
+        try:
+            sizes = parse_sizes(read_line("크기: "))
+            break
+        except ValidationError as err:
+            print(f"  입력 형식 오류: {err} → 다시 입력하세요.")
+
+    section("[2] 패턴 생성")
+    generated = {}
+    for n in sizes:
+        cross = generate_pattern(LABEL_CROSS, n)
+        x = generate_pattern(LABEL_X, n)
+        generated[n] = (cross, x)
+        note = " (짝수 N: 가운데 2줄)" if n % 2 == 0 else ""
+        print(f"✓ {n}×{n} 생성 완료 — Cross 칸 {sum(cross.flatten()):g}개{note}, X 칸 {sum(x.flatten()):g}개")
+    small = [n for n in sizes if n <= PREVIEW_MAX_SIZE]
+    for n in small:
+        print()
+        print(f"[{n}×{n} 미리보기]")
+        print_preview(*generated[n])
+    if len(small) < len(sizes):
+        print()
+        print(f"({PREVIEW_MAX_SIZE}×{PREVIEW_MAX_SIZE}보다 큰 패턴은 미리보기를 생략합니다)")
+
+    section("[3] 생성 패턴 판정 검증 (입력과 필터 모두 생성 패턴)")
+    total = passed = 0
+    for n in sizes:
+        cross, x = generated[n]
+        for expected, pattern in ((LABEL_CROSS, cross), (LABEL_X, x)):
+            score_cross = mac(pattern, cross)
+            score_x = mac(pattern, x)
+            verdict = judge(score_cross, score_x, LABEL_CROSS, LABEL_X)
+            ok = verdict == expected
+            total += 1
+            passed += ok
+            print(f"{pad(f'{n}×{n} {expected} 입력', 16)} Cross 점수 {score_cross:>5g} | X 점수 {score_x:>5g}"
+                  f" | 판정 {pad(verdict, 9)} | {'PASS' if ok else 'FAIL'}")
+    print(f"→ {total}개 중 {passed}개 PASS")
+
+    section(f"[4] 성능 분석 (평균/{REPEAT}회 · 입력 = 생성 X 패턴, 필터 = 생성 Cross 패턴)")
+    run_performance([(generated[n][1], generated[n][0]) for n in sizes])
+
+
+# ---------------------------------------------------------------------------
 # 진입점
 # ---------------------------------------------------------------------------
 def main(argv):
@@ -587,8 +841,10 @@ def main(argv):
         mode = choose_mode()
         if mode == "1":
             run_user_mode()
-        else:
+        elif mode == "2":
             run_json_mode(data_path)
+        else:
+            run_generator_mode()
     except (EOFError, KeyboardInterrupt):
         print()
         print("입력이 종료되어 프로그램을 마칩니다.")
